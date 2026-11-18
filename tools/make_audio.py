@@ -190,6 +190,64 @@ def sfx():
     x = np.where((phase % 1.0) < 0.5, 1.0, -1.0) * env(len(t), 0.02, curve=0.5)
     write("siren", x, 0.4)
 
+    # Dodge roll whoosh
+    d = 0.22
+    x = lowpass(noise(d, 1), 5) * np.sin(np.linspace(0, np.pi, int(SR * d))) ** 2
+    x += sweep(200, 500, d, "tri") * env(int(SR * d), 0.02, curve=1) * 0.2
+    write("dodge", x, 0.4)
+
+    # Mace swing: low whoosh + thump
+    d = 0.2
+    x = lowpass(noise(d, 2), 8) * np.sin(np.linspace(0, np.pi, int(SR * d))) ** 3
+    x += sweep(160, 60, d, "square") * env(int(SR * d), 0.08, curve=2) * 0.4
+    write("swing", crush(x), 0.5)
+
+    # Crossbow twang
+    d = 0.25
+    t = t_arr(d)
+    x = tri(110 * (1 + 0.5 * np.exp(-t * 30)), d) * env(len(t), 0.001, curve=2)
+    x += noise(d, 3) * env(len(t), 0.001, curve=6) * 0.4
+    write("bow", x, 0.45)
+
+    # AK-47: heavier, lower crack than the pistol
+    d = 0.14
+    x = noise(d, 3) * env(int(SR * d), 0.001, curve=3)
+    x += sweep(500, 90, d, "square", 0.4) * env(int(SR * d), 0.001, curve=2) * 0.6
+    write("ak", crush(x), 0.5)
+
+    # Minigun wind-up (rising whine)
+    d = 0.9
+    x = sweep(80, 900, d, "square", 0.3) * env(int(SR * d), 0.3, curve=0.3) * 0.5
+    x += noise(d, 12) * 0.1
+    write("rev", crush(x), 0.4)
+
+    # Powerup: rising arpeggio sweep with shimmer
+    parts = []
+    for n in [60, 64, 67, 72, 76, 79, 84, 88]:
+        dd = 0.05
+        parts.append((square(midi(n), dd, 0.25) * 0.6 + square(midi(n + 7), dd, 0.5) * 0.3)
+                     * env(int(SR * dd), 0.001, curve=0.8))
+    tail = square(midi(96), 0.35, 0.125) * env(int(SR * 0.35), 0.001, curve=1.5) * 0.5
+    write("powerup", np.concatenate(parts + [tail]), 0.5)
+
+    # Level clear fanfare
+    seq = [(67, 0.1), (72, 0.1), (76, 0.1), (79, 0.2), (76, 0.1), (79, 0.5)]
+    parts = []
+    for n, dd in seq:
+        a = square(midi(n), dd, 0.5) * 0.5 + square(midi(n - 12), dd, 0.25) * 0.3
+        parts.append(a * env(int(SR * dd), 0.002, curve=0.6))
+    write("fanfare", np.concatenate(parts), 0.5)
+
+    # Waves on the beach (loopable-ish ambience)
+    d = 6.0
+    t = t_arr(d)
+    swell = 0.35 + 0.65 * (0.5 + 0.5 * np.sin(2 * np.pi * t / 3.0 - np.pi / 2)) ** 2
+    x = lowpass(noise(d, 1), 20) * swell
+    fade = int(SR * 0.3)
+    x[:fade] *= np.linspace(0, 1, fade)
+    x[-fade:] *= np.linspace(1, 0, fade)
+    write("waves", x, 0.35)
+
     # Game over jingle (sad descending)
     seq = [(64, 0.18), (63, 0.18), (62, 0.18), (61, 0.6)]
     parts = []

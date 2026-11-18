@@ -4,12 +4,15 @@ extends Node2D
 ## Enemies, shots, pickups and effects are plain objects drawn in a few batched
 ## _draw() passes rather than one node each, so hundreds of enemies stay cheap
 ## (important for the web build).
+##
+## Level 1 (beach) is a horizontal strip: endless to the left and right, with the
+## dunes to the north and the ocean to the south. At 20:00 a pier appears with the
+## boss on it; beat him and walk north to reach level 2 (Main Street).
 
 const Data := preload("res://src/data.gd")
 const Drawer := preload("res://src/drawer.gd")
 const Hud := preload("res://src/hud.gd")
 
-const WIN_TIME := 15.0 * 60.0
 const CELL := 24.0
 const MAX_ENEMIES := 360
 const MAX_GEMS := 400
@@ -17,13 +20,21 @@ const BASE_SPEED := 72.0
 const BASE_MAGNET := 26.0
 const PROP_CELL := 112
 
-## [time in seconds, event]
-const EVENTS := [
-	[150.0, "ring"], [300.0, "boss"], [390.0, "ring"], [480.0, "swarm"],
-	[600.0, "boss"], [690.0, "ring"], [780.0, "swarm"], [840.0, "boss"],
-]
+# beach geometry (world y)
+const BEACH_TOP := -60.0       # player can't walk further north (dunes)
+const BEACH_BOTTOM := 40.0     # ...or further south (water)
+const ENEMY_TOP := -76.0
+const ENEMY_BOTTOM := 46.0
+const SHORE_Y := 50.0
+const DUNE_Y := -72.0
 
-enum State { TITLE, PLAY, LEVELUP, PAUSE, OVER, WIN }
+# dodge roll
+const DODGE_TIME := 0.28
+const DODGE_SPEED := 240.0
+const DODGE_IFRAMES := 0.45
+const DODGE_COOLDOWN := 0.9
+
+enum State { TITLE, PLAY, LEVELUP, PAUSE, OVER, WIN, TRANSITION }
 
 
 class Enemy:
@@ -43,6 +54,13 @@ class Enemy:
 	var chuck_cd := 0.0
 	var face_left := false
 	var dead := false
+	# boss attack state (Don): 0 walk, 1 wind-up, 2 spraying
+	var atk_state := 0
+	var atk_t := 3.0
+	var atk_dur := 1.0
+	var aim := 0.0
+	var sweep_dir := 1.0
+	var fire_t := 0.0
 
 
 class Shot:
@@ -63,10 +81,18 @@ class Shot:
 	var blast := 24.0
 	var target: Enemy = null
 	var smoke_t := 0.0
+	var arc := 26.0
+
+
+class EShot:
+	var pos := Vector2.ZERO
+	var vel := Vector2.ZERO
+	var dmg := 10.0
+	var life := 2.5
 
 
 class Pickup:
-	var kind := "gem"  # gem, pizza, magnet, case
+	var kind := "gem"  # gem, pizza, magnet, case, snow
 	var pos := Vector2.ZERO
 	var val := 1
 	var tier := 0
@@ -83,30 +109,62 @@ class Fx:
 	var r := 6.0
 	var color := Color.WHITE
 	var text := ""
+	var rot := 0.0
+	var flip := false
 
 
 var state: State = State.TITLE
 var rng := RandomNumberGenerator.new()
 var cam: Camera2D
+var cam_pos := Vector2.ZERO
 var hud: Node2D
 var shake := 0.0
 var clock := 0.0
 
+# level
+var level_id := 1
+var lvl: Dictionary = {}
+var intro_t := 0.0        # wake-up animation on the beach
+var card_t := 0.0         # level title card
+var trans_t := 0.0
+var pier_active := false
+var pier_x := 0.0
+var don_spawned := false
+var don_dead := false
+var boss_ref: Enemy = null
+
 # player
 var ppos := Vector2.ZERO
 var pface := Vector2.RIGHT
+var pmove := Vector2.ZERO
 var pmoving := false
 var anim_t := 0.0
 var hp := 100.0
 var max_hp := 100.0
 var hurt_t := 0.0
+var bullet_iframe := 0.0
 var level := 1
 var xp := 0.0
 var xp_next := 5.0
 var kills := 0
 var score := 0
 var time := 0.0
+var total_time := 0.0
 var stats := {}
+
+# dodge
+var dodge_t := 0.0
+var dodge_cd := 0.0
+var iframe_t := 0.0
+var dodge_dir := Vector2.RIGHT
+var ghost_t := 0.0
+
+# supercharge (powerup)
+var super_t := 0.0
+var super_fire_t := 0.0
+var super_gl_t := 0.0
+var super_aim := 0.0
+var snow_t := 70.0
 
 var weapons := {}
 var weapon_order: Array = []
@@ -115,6 +173,7 @@ var passive_order: Array = []
 
 var enemies: Array = []
 var shots: Array = []
+var eshots: Array = []
 var pickups: Array = []
 var fx: Array = []
 var grid := {}
@@ -130,16 +189,21 @@ var choices: Array = []
 var sel := 0
 var menu_t := 0.0
 
-# touch joystick
+# touch controls
 var touch_idx := -1
 var touch_origin := Vector2.ZERO
 var touch_vec := Vector2.ZERO
+var touch_seen := false
 
 # automated test mode (used by CI / local headless runs)
 var autotest := -1.0
 var god := false
 var shot_path := ""
 var shot_at := -1.0
+var start_level := 1
+var start_time := 0.0
+var don_hp_override := -1.0
+var force_super := false
 
 
 func _ready() -> void:
@@ -167,9 +231,6 @@ func _ready() -> void:
 	hud.game = self
 	layer.add_child(hud)
 
-	_reset_run()
-	state = State.TITLE
-
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--autotest="):
 			autotest = float(a.get_slice("=", 1))
@@ -179,6 +240,17 @@ func _ready() -> void:
 			shot_path = a.get_slice("=", 1)
 		elif a.begins_with("--shot-at="):
 			shot_at = float(a.get_slice("=", 1))
+		elif a.begins_with("--level="):
+			start_level = int(a.get_slice("=", 1))
+		elif a.begins_with("--time="):
+			start_time = float(a.get_slice("=", 1))
+		elif a.begins_with("--don-hp="):
+			don_hp_override = float(a.get_slice("=", 1))
+		elif a == "--super":
+			force_super = true
+
+	_reset_run()
+	state = State.TITLE
 	if autotest > 0.0 and not "--title" in OS.get_cmdline_user_args():
 		_start()
 
@@ -189,6 +261,7 @@ func _setup_input() -> void:
 	_add_action("move_up", [KEY_W, KEY_UP], [JOY_BUTTON_DPAD_UP], [[JOY_AXIS_LEFT_Y, -1.0]])
 	_add_action("move_down", [KEY_S, KEY_DOWN], [JOY_BUTTON_DPAD_DOWN], [[JOY_AXIS_LEFT_Y, 1.0]])
 	_add_action("confirm", [KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_Z], [JOY_BUTTON_A], [])
+	_add_action("dodge", [KEY_SHIFT, KEY_SPACE, KEY_K, KEY_X], [JOY_BUTTON_B, JOY_BUTTON_RIGHT_SHOULDER], [])
 	_add_action("pause", [KEY_ESCAPE, KEY_P], [JOY_BUTTON_START], [])
 	_add_action("mute", [KEY_M], [], [])
 
@@ -214,46 +287,73 @@ func _add_action(action: String, keys: Array, buttons: Array, axes: Array) -> vo
 # ====================================================================== run
 
 func _reset_run() -> void:
-	ppos = Vector2.ZERO
-	pface = Vector2.RIGHT
 	hp = 100.0
 	max_hp = 100.0
-	hurt_t = 0.0
 	level = 1
 	xp = 0.0
 	xp_next = _xp_for(1)
 	kills = 0
 	score = 0
-	time = 0.0
+	total_time = 0.0
 	weapons.clear()
 	weapon_order.clear()
 	passives.clear()
 	passive_order.clear()
+	bosses_spawned = 0
+	pending = 0
+	_recalc_stats()
+	_add_weapon("pistol")
+	_load_level(start_level)
+	time = start_time
+	for ev in lvl.events:
+		if ev[0] < start_time:
+			events_done[ev[0]] = true
+
+
+## Resets the world for a level; the player's build (weapons, items, level) carries over.
+func _load_level(id: int) -> void:
+	level_id = id
+	lvl = Data.LEVELS[id]
+	time = 0.0
+	ppos = Vector2(0, 28) if id == 1 else Vector2.ZERO
+	pface = Vector2.RIGHT
+	hurt_t = 0.0
+	dodge_t = 0.0
+	dodge_cd = 0.0
+	iframe_t = 0.0
+	super_t = 0.0
+	snow_t = 70.0
 	enemies.clear()
 	shots.clear()
+	eshots.clear()
 	pickups.clear()
 	fx.clear()
 	grid.clear()
 	spawn_t = 0.5
 	events_done.clear()
-	bosses_spawned = 0
 	banner = ""
 	banner_t = 0.0
-	pending = 0
-	_recalc_stats()
-	_add_weapon("pistol")
+	pier_active = false
+	don_spawned = false
+	don_dead = false
+	boss_ref = null
+	intro_t = 3.0 if id == 1 else 0.0
+	card_t = 3.5
+	Sfx.set_ambience(id == 1 and state != State.TITLE)
+	Sfx.set_music_pitch(1.0)
 
 
 func _start() -> void:
-	_reset_run()
 	state = State.PLAY
+	_reset_run()
 	Sfx.play("confirm", 0.0)
 	Sfx.stop_music()
 	Sfx.start_music()
+	Sfx.set_ambience(level_id == 1)
 
 
-func _xp_for(lvl: int) -> float:
-	return 5.0 + (lvl - 1) * 9.0 + floorf(pow(lvl - 1, 2) * 0.3)
+func _xp_for(lvl_n: int) -> float:
+	return 5.0 + (lvl_n - 1) * 9.0 + floorf(pow(lvl_n - 1, 2) * 0.3)
 
 
 func _recalc_stats() -> void:
@@ -275,9 +375,18 @@ func _recalc_stats() -> void:
 func _add_weapon(id: String) -> void:
 	weapons[id] = {
 		"lvl": 1, "t": 0.3, "burst": 0, "burst_t": 0.0, "angle": 0.0,
-		"pulse": 1.0, "points": [], "s": Data.weapon_stats(id, 1),
+		"pulse": 1.0, "points": [], "swing_t": 9.0, "swing_dir": 0.0,
+		"s": Data.weapon_stats(id, 1),
 	}
 	weapon_order.append(id)
+
+
+func difficulty() -> float:
+	return lvl.diff_offset + time / 60.0 * lvl.diff_scale
+
+
+func is_supercharged() -> bool:
+	return super_t > 0.0
 
 
 # ====================================================================== loop
@@ -291,56 +400,60 @@ func _process(delta: float) -> void:
 		State.LEVELUP, State.OVER, State.WIN:
 			menu_t += delta
 			_update_fx(delta * 0.5)
+		State.TRANSITION:
+			_update_transition(delta)
 		_:
 			pass
 
 	if autotest > 0.0:
+		if force_super and state == State.PLAY and intro_t <= 0.6 and super_t <= 0.0:
+			super_t = Data.SUPER_TIME
 		_autotest_step()
 
 	shake = maxf(0.0, shake - delta * 10.0)
-	cam.position = ppos.round()
+	if level_id == 1:
+		cam_pos = Vector2(ppos.x, -6.0)
+	else:
+		cam_pos = ppos
+	cam.position = cam_pos.round()
 	cam.offset = Vector2(rng.randf_range(-shake, shake), rng.randf_range(-shake, shake)).round()
 
 
 func _update_play(delta: float) -> void:
+	card_t -= delta
+	if intro_t > 0.0:
+		# waking up next to the wrecked speedboat
+		intro_t -= delta
+		if rng.randf() < delta * 4.0:
+			_add_smoke(Vector2(-46 + rng.randf_range(-4, 4), 36))
+		_update_fx(delta)
+		if intro_t > 0.6:
+			return
+
 	time += delta
-	if time >= WIN_TIME:
+	total_time += delta
+
+	if level_id == 2 and time >= lvl.duration:
 		_win()
 		return
+	if level_id == 1 and time >= lvl.duration and not pier_active:
+		_start_pier()
 
-	var v := Input.get_vector("move_left", "move_right", "move_up", "move_down")
-	if touch_idx >= 0:
-		v = touch_vec
-	if autotest > 0.0:
-		v = Vector2.from_angle(time * 0.4) * 0.9
-		var best: Pickup = null
-		var bd := 1e9
-		for p in pickups:
-			var d2: float = p.pos.distance_squared_to(ppos)
-			if d2 < bd:
-				bd = d2
-				best = p
-		if best != null and bd < 150.0 * 150.0:
-			v = (best.pos - ppos).normalized()
-	v = v.limit_length(1.0)
-	pmoving = v.length() > 0.1
-	if pmoving:
-		pface = v.normalized()
-		anim_t += delta * v.length()
-	ppos += v * BASE_SPEED * stats.speed * delta
-
-	hp = minf(max_hp, hp + stats.regen * delta)
-	hurt_t -= delta
-	banner_t -= delta
-
+	_update_player(delta)
 	_spawn(delta)
 	_build_grid()
 	_update_enemies(delta)
 	_update_weapons(delta)
+	if super_t > 0.0:
+		_update_super(delta)
 	_update_shots(delta)
+	_update_eshots(delta)
 	_update_pickups(delta)
 	_update_fx(delta)
 	enemies = enemies.filter(func(e): return not e.dead)
+
+	if level_id == 1 and smoke_due():
+		_add_smoke(Vector2(-46 + rng.randf_range(-4, 4), 36))
 
 	if hp <= 0.0:
 		if god:
@@ -348,29 +461,164 @@ func _update_play(delta: float) -> void:
 		else:
 			_game_over()
 			return
+
+	if don_dead and ppos.distance_to(Vector2(pier_x, BEACH_TOP)) < 22.0:
+		_begin_transition()
+		return
+
 	if pending > 0:
 		_open_levelup()
+
+
+func smoke_due() -> bool:
+	return absf(ppos.x + 46.0) < 260.0 and rng.randf() < 0.05
+
+
+func _add_smoke(pos: Vector2) -> void:
+	var f := Fx.new()
+	f.kind = "smoke"
+	f.pos = pos
+	f.vel = Vector2(rng.randf_range(-3, 3), -14)
+	f.dur = 1.2
+	f.r = 3.0
+	f.color = Color(0.35, 0.33, 0.38)
+	fx.append(f)
+
+
+func _update_player(delta: float) -> void:
+	var v := Input.get_vector("move_left", "move_right", "move_up", "move_down")
+	if touch_idx >= 0:
+		v = touch_vec
+	if autotest > 0.0:
+		v = _bot_move()
+	v = v.limit_length(1.0)
+	pmove = v
+	pmoving = v.length() > 0.1
+	if pmoving:
+		pface = v.normalized()
+		anim_t += delta * v.length()
+
+	dodge_cd -= delta
+	iframe_t -= delta
+	bullet_iframe -= delta
+	if dodge_t > 0.0:
+		dodge_t -= delta
+		ppos += dodge_dir * DODGE_SPEED * delta
+		ghost_t -= delta
+		if ghost_t <= 0.0:
+			ghost_t = 0.04
+			var g := Fx.new()
+			g.kind = "ghost"
+			g.pos = ppos
+			g.dur = 0.25
+			g.rot = (1.0 - dodge_t / DODGE_TIME) * TAU * (1.0 if dodge_dir.x >= 0.0 else -1.0)
+			g.flip = pface.x < 0.0
+			fx.append(g)
+	else:
+		var spd: float = BASE_SPEED * stats.speed * (1.3 if super_t > 0.0 else 1.0)
+		ppos += v * spd * delta
+	ppos = _clamp_player(ppos)
+
+	hp = minf(max_hp, hp + stats.regen * delta)
+	hurt_t -= delta
+	banner_t -= delta
+
+
+func _try_dodge() -> void:
+	if state != State.PLAY or dodge_cd > 0.0 or intro_t > 0.6:
+		return
+	dodge_dir = pmove.normalized() if pmove.length() > 0.2 else pface
+	dodge_t = DODGE_TIME
+	iframe_t = DODGE_IFRAMES
+	dodge_cd = DODGE_COOLDOWN
+	ghost_t = 0.0
+	Sfx.play("dodge", 0.1, -4.0, 0.0)
+
+
+func _clamp_player(p: Vector2) -> Vector2:
+	if level_id == 1:
+		p.y = clampf(p.y, BEACH_TOP, BEACH_BOTTOM)
+	return p
+
+
+# ====================================================================== level flow
+
+func _start_pier() -> void:
+	pier_active = true
+	var side := 1.0 if pface.x >= 0.0 else -1.0
+	pier_x = roundf(ppos.x + side * 120.0)
+	banner = "A PIER... SOMEONE'S WAITING"
+	banner_t = 3.0
+	don_spawned = true
+	bosses_spawned += 1
+	boss_ref = _spawn_enemy("don", Vector2(pier_x, ENEMY_BOTTOM))
+	boss_ref.atk_t = 3.0
+	if don_hp_override > 0.0:
+		boss_ref.hp = don_hp_override
+	Sfx.play("siren", 0.0, -2.0, 0.0)
+
+
+func _begin_transition() -> void:
+	state = State.TRANSITION
+	trans_t = 0.0
+	Sfx.play("fanfare", 0.0, 0.0, 0.0)
+
+
+func _update_transition(delta: float) -> void:
+	var before := trans_t
+	trans_t += delta
+	if before < 1.0 and trans_t >= 1.0:
+		# collect anything left lying around, then load the next level
+		for p in pickups:
+			if p.kind == "gem":
+				xp += p.val * stats.growth
+		hp = max_hp
+		_load_level(level_id + 1)
+		Sfx.set_ambience(false)
+	if trans_t >= 1.6:
+		state = State.PLAY
+		while xp >= xp_next:
+			xp -= xp_next
+			level += 1
+			pending += 1
+			xp_next = _xp_for(level)
 
 
 # ====================================================================== spawning
 
 func _spawn(delta: float) -> void:
-	for ev in EVENTS:
+	for ev in lvl.events:
 		if time >= ev[0] and not events_done.has(ev[0]):
 			events_done[ev[0]] = true
 			_run_event(ev[1])
 
+	snow_t -= delta
 	spawn_t -= delta
 	if spawn_t > 0.0:
 		return
-	var m := time / 60.0
+	var m := difficulty()
 	spawn_t = maxf(0.12, 0.6 - m * 0.04)
 	var target := mini(MAX_ENEMIES, 10 + int(m * 24.0))
+	if level_id == 1:
+		target = int(target * 0.7)  # narrower arena
+	if pier_active:
+		target = int(target * (0.25 if not don_dead else 0.15))
 	var batch := 1 + int(m / 2.5)
 	for i in batch:
 		if enemies.size() >= target:
 			break
 		_spawn_enemy(_pick_kind(m), _offscreen_pos())
+
+	# the occasional pile of "snow" (supercharge powerup)
+	if snow_t <= 0.0:
+		snow_t = 90.0
+		var has_snow := false
+		for p in pickups:
+			if p.kind == "snow":
+				has_snow = true
+		if not has_snow and super_t <= 0.0:
+			var off := Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(60.0, 110.0)
+			_drop("snow", _clamp_player(ppos + off))
 
 
 func _pick_kind(m: float) -> String:
@@ -393,6 +641,9 @@ func _pick_kind(m: float) -> String:
 
 
 func _offscreen_pos() -> Vector2:
+	if level_id == 1:
+		var side := 1.0 if rng.randf() < 0.5 else -1.0
+		return Vector2(ppos.x + side * rng.randf_range(185.0, 215.0), rng.randf_range(ENEMY_TOP, BEACH_BOTTOM))
 	return ppos + Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(200.0, 230.0)
 
 
@@ -401,10 +652,12 @@ func _spawn_enemy(kind: String, pos: Vector2) -> Enemy:
 	var e := Enemy.new()
 	e.kind = kind
 	e.pos = pos
-	var m := time / 60.0
-	e.boss = kind == "boss"
-	if e.boss:
+	var m := difficulty()
+	e.boss = kind == "boss" or kind == "don"
+	if kind == "boss":
 		e.max_hp = d.hp * (1.0 + bosses_spawned * 1.2)
+	elif kind == "don":
+		e.max_hp = d.hp
 	else:
 		e.max_hp = d.hp * (1.0 + m * 0.35)
 	e.hp = e.max_hp
@@ -418,18 +671,28 @@ func _spawn_enemy(kind: String, pos: Vector2) -> Enemy:
 
 
 func _run_event(kind: String) -> void:
-	var m := time / 60.0
+	var m := difficulty()
+	var k := "ninja" if m >= 5.0 else "punk"
 	match kind:
 		"ring":
 			var n := 40
-			var k := "ninja" if m >= 5.0 else "punk"
 			for i in n:
 				_spawn_enemy(k, ppos + Vector2.from_angle(TAU * i / n) * 170.0)
 			banner = "THEY'VE GOT YOU SURROUNDED!"
 			banner_t = 2.5
+		"pincer":
+			for side in [-1.0, 1.0]:
+				for i in 16:
+					var y := lerpf(ENEMY_TOP, BEACH_BOTTOM, i / 15.0)
+					_spawn_enemy(k, Vector2(ppos.x + side * (180.0 + (i % 2) * 12.0), y))
+			banner = "THEY'RE COMING FROM BOTH SIDES!"
+			banner_t = 2.5
 		"swarm":
-			var a := rng.randf() * TAU
-			var center := ppos + Vector2.from_angle(a) * 210.0
+			var center: Vector2
+			if level_id == 1:
+				center = Vector2(ppos.x + (210.0 if rng.randf() < 0.5 else -210.0), -10.0)
+			else:
+				center = ppos + Vector2.from_angle(rng.randf() * TAU) * 210.0
 			for i in 30:
 				var e := _spawn_enemy("ninja", center + Vector2(rng.randf_range(-30, 30), rng.randf_range(-30, 30)))
 				e.speed *= 1.4
@@ -461,7 +724,7 @@ func _build_grid() -> void:
 
 func _query(pos: Vector2, r: float) -> Array:
 	var out := []
-	var pad := r + 16.0
+	var pad := r + 26.0
 	var c0 := _cell(pos - Vector2(pad, pad))
 	var c1 := _cell(pos + Vector2(pad, pad))
 	for cx in range(c0.x, c1.x + 1):
@@ -503,12 +766,20 @@ func _update_enemies(delta: float) -> void:
 			continue
 		var to: Vector2 = ppos - e.pos
 		var dist := to.length()
-		if dist > 340.0 and not e.boss:
-			# wandered too far behind: bring them back in front of the player
-			e.pos = ppos + (to / dist).rotated(rng.randf_range(-0.7, 0.7)) * 215.0
-			continue
+		if not e.boss:
+			if level_id == 1:
+				if absf(to.x) > 260.0:
+					e.pos.x = ppos.x + signf(to.x) * 200.0
+					continue
+			elif dist > 340.0:
+				# wandered too far behind: bring them back in front of the player
+				e.pos = ppos + (to / dist).rotated(rng.randf_range(-0.7, 0.7)) * 215.0
+				continue
 		var dir := to / maxf(dist, 0.001)
 		var vel: Vector2 = dir * e.speed
+
+		if e.kind == "don":
+			vel = _update_don(e, dir, delta)
 
 		# soft separation so crowds spread out instead of stacking
 		var push := Vector2.ZERO
@@ -532,17 +803,87 @@ func _update_enemies(delta: float) -> void:
 		vel += push * 7.0
 
 		e.pos += (vel + e.knock) * delta
+		if level_id == 1:
+			e.pos.y = clampf(e.pos.y, ENEMY_TOP, ENEMY_BOTTOM)
 		e.knock *= damp
 		e.flash -= delta
 		e.chuck_cd -= delta
-		e.anim += delta * e.speed / 28.0
+		e.anim += delta * e.speed / 28.0 * (0.0 if e.kind == "don" and e.atk_state != 0 else 1.0)
 		e.face_left = dir.x < 0.0
 
 		if dist < e.radius + 5.0:
 			_hurt_player(e.dmg * delta)
 
 
+## The Don walks toward you, revs his minigun, then sweeps a stream of bullets
+## across the screen. Below half health he sprays two streams and rests less.
+func _update_don(e: Enemy, dir: Vector2, delta: float) -> Vector2:
+	var enraged := e.hp < e.max_hp * 0.5
+	e.atk_t -= delta
+	match e.atk_state:
+		0:
+			if e.atk_t <= 0.0:
+				e.atk_state = 1
+				e.atk_t = 0.8
+				e.aim = dir.angle()
+				Sfx.play("rev", 0.0, -2.0, 0.0)
+			return dir * e.speed
+		1:
+			if int(e.atk_t * 20.0) % 2 == 0:
+				e.flash = 0.03
+			if e.atk_t <= 0.0:
+				e.atk_state = 2
+				e.atk_dur = 2.6 if enraged else 2.2
+				e.atk_t = e.atk_dur
+				e.sweep_dir = 1.0 if rng.randf() < 0.5 else -1.0
+				e.fire_t = 0.0
+			return Vector2.ZERO
+		_:
+			e.fire_t -= delta
+			var k: float = 1.0 - e.atk_t / e.atk_dur
+			var sweep := 1.9
+			while e.fire_t <= 0.0:
+				e.fire_t += 0.035
+				var a: float = e.aim - e.sweep_dir * sweep / 2.0 + e.sweep_dir * sweep * k
+				var muzzle := e.pos + Vector2(-14.0 if e.face_left else 14.0, 6.0)
+				_add_eshot(muzzle, Vector2.from_angle(a) * 150.0, 12.0)
+				if enraged:
+					var a2: float = e.aim + e.sweep_dir * sweep / 2.0 - e.sweep_dir * sweep * k
+					_add_eshot(muzzle, Vector2.from_angle(a2) * 130.0, 12.0)
+				Sfx.play("uzi", 0.05, -10.0, 0.06)
+			shake = maxf(shake, 0.8)
+			if e.atk_t <= 0.0:
+				e.atk_state = 0
+				e.atk_t = 2.5 if enraged else 4.0
+			return Vector2.ZERO
+
+
+func _add_eshot(pos: Vector2, vel: Vector2, dmg: float) -> void:
+	var s := EShot.new()
+	s.pos = pos
+	s.vel = vel
+	s.dmg = dmg
+	eshots.append(s)
+
+
+func _update_eshots(delta: float) -> void:
+	for s in eshots:
+		s.pos += s.vel * delta
+		s.life -= delta
+		if s.pos.distance_squared_to(ppos) < 36.0:
+			if iframe_t <= 0.0 and bullet_iframe <= 0.0:
+				hp -= s.dmg * stats.armor
+				bullet_iframe = 0.3
+				hurt_t = 0.25
+				shake = maxf(shake, 2.0)
+				Sfx.play("hurt", 0.05, -3.0, 0.1)
+				s.life = 0.0
+	eshots = eshots.filter(func(s): return s.life > 0.0)
+
+
 func _hurt_player(amount: float) -> void:
+	if iframe_t > 0.0:
+		return
 	hp -= amount * stats.armor
 	if hurt_t <= 0.0:
 		hurt_t = 0.25
@@ -585,6 +926,16 @@ func _kill(e: Enemy) -> void:
 		_drop("case", e.pos)
 		for i in 10:
 			_drop_gem(e.pos + Vector2.from_angle(TAU * i / 10.0) * 18.0, 10)
+		if e.kind == "don":
+			score += 5000
+			don_dead = true
+			boss_ref = null
+			eshots.clear()
+			for i in 4:
+				_add_fx("boom", e.pos + Vector2(rng.randf_range(-20, 20), rng.randf_range(-16, 16)), 0.6 + i * 0.15, 30.0, Color.WHITE)
+			banner = "THE DON IS DOWN! HEAD NORTH TO MAIN STREET"
+			banner_t = 6.0
+			Sfx.play("fanfare", 0.0, 0.0, 0.0)
 		return
 	_drop_gem(e.pos, e.xp)
 	var r := rng.randf()
@@ -592,6 +943,8 @@ func _kill(e: Enemy) -> void:
 		_drop("pizza", e.pos)
 	elif r < 0.0085:
 		_drop("magnet", e.pos)
+	elif r < 0.0088:
+		_drop("snow", e.pos)
 
 
 func _drop_gem(pos: Vector2, val: int) -> void:
@@ -634,11 +987,11 @@ func _drop(kind: String, pos: Vector2) -> void:
 func _amount_for(id: String) -> int:
 	var a: int = stats.amount
 	match id:
-		"uzi":
+		"uzi", "ak":
 			return a * 3
 		"shotgun":
 			return a * 2
-		"boombox":
+		"boombox", "mace":
 			return 0
 	return a
 
@@ -663,19 +1016,34 @@ func _update_weapons(delta: float) -> void:
 					var r: float = s.radius * stats.area
 					for e in _query(ppos, r):
 						_damage(e, s.dmg, (e.pos - ppos).normalized(), s.knock)
+			"mace":
+				w.swing_t += delta
+				w.t -= delta
+				if w.t <= 0.0:
+					w.t = s.cd * stats.cd
+					_swing_mace(w, s)
 			_:
 				w.t -= delta
 				if w.t <= 0.0:
 					w.t = s.cd * stats.cd
 					_fire(id, w, s)
-				if id == "uzi" and w.burst > 0:
+				if (id == "uzi" or id == "ak") and w.burst > 0:
 					w.burst_t -= delta
 					while w.burst > 0 and w.burst_t <= 0.0:
-						w.burst_t += 0.045
+						w.burst_t += 0.045 if id == "uzi" else 0.08
 						w.burst -= 1
-						var dir := pface.rotated(rng.randf_range(-s.spread, s.spread))
-						_add_shot("bullet", _gun_pos(), dir * s.speed, s.dmg, s.pierce, 0.9, 3.0, 12.0)
-						Sfx.play("uzi", 0.1, -6.0, 0.04)
+						if id == "uzi":
+							var dir := pface.rotated(rng.randf_range(-s.spread, s.spread))
+							_add_shot("bullet", _gun_pos(), dir * s.speed, s.dmg, s.pierce, 0.9, 3.0, 12.0)
+							Sfx.play("uzi", 0.1, -6.0, 0.04)
+						else:
+							var near := _nearest(ppos, 190.0, 1)
+							var dir := pface
+							if near.size() > 0:
+								dir = (near[0].pos - _gun_pos()).normalized()
+							dir = dir.rotated(rng.randf_range(-0.04, 0.04))
+							_add_shot("bullet", _gun_pos(), dir * s.speed, s.dmg, s.pierce, 1.0, 3.0, 25.0)
+							Sfx.play("ak", 0.08, -5.0, 0.04)
 
 
 func _fire(id: String, w: Dictionary, s: Dictionary) -> void:
@@ -694,7 +1062,7 @@ func _fire(id: String, w: Dictionary, s: Dictionary) -> void:
 					dir = pface.rotated((i - (n - 1) / 2.0) * 0.14)
 				_add_shot("bullet", _gun_pos(), dir * s.speed, s.dmg, s.pierce, 1.2, 3.0, 20.0)
 			Sfx.play("shoot", 0.08, -4.0)
-		"uzi":
+		"uzi", "ak":
 			w.burst = n
 			w.burst_t = 0.0
 		"shotgun":
@@ -705,9 +1073,8 @@ func _fire(id: String, w: Dictionary, s: Dictionary) -> void:
 			for i in n:
 				var a: float = -s.spread / 2.0 + s.spread * (i / maxf(1.0, n - 1.0))
 				var dir := base.rotated(a + rng.randf_range(-0.05, 0.05))
-				var sh := _add_shot("pellet", _gun_pos(), dir * s.speed * rng.randf_range(0.85, 1.15),
+				_add_shot("pellet", _gun_pos(), dir * s.speed * rng.randf_range(0.85, 1.15),
 					s.dmg, s.pierce, s.life, 3.0, s.knock)
-				sh.rot = 0.0
 			shake = maxf(shake, 1.5)
 			Sfx.play("shotgun", 0.06, -3.0)
 		"grenade":
@@ -718,11 +1085,7 @@ func _fire(id: String, w: Dictionary, s: Dictionary) -> void:
 					tp = targets[rng.randi() % targets.size()].pos
 				else:
 					tp = ppos + Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(40.0, 90.0)
-				var sh := _add_shot("grenade", ppos, Vector2.ZERO, s.dmg, 99, 99.0, 0.0, 0.0)
-				sh.start = ppos
-				sh.target_pos = tp
-				sh.dur = 0.55 + i * 0.08
-				sh.blast = s.radius
+				_lob_grenade(ppos, tp, 0.55 + i * 0.08, s.dmg, s.radius)
 			Sfx.play("throw", 0.1, -4.0)
 		"rocket":
 			var targets := _nearest(ppos, 260.0, n)
@@ -734,6 +1097,39 @@ func _fire(id: String, w: Dictionary, s: Dictionary) -> void:
 				if targets.size() > 0:
 					sh.target = targets[i % targets.size()]
 			Sfx.play("throw", 0.05, -2.0)
+		"crossbow":
+			var targets := _nearest(ppos, 220.0, 1)
+			var base := pface
+			if targets.size() > 0:
+				base = (targets[0].pos - _gun_pos()).normalized()
+			for i in n:
+				var dir := base.rotated((i - (n - 1) / 2.0) * 0.12)
+				_add_shot("bolt", _gun_pos(), dir * s.speed, s.dmg, s.pierce, 1.6, 4.0, s.knock)
+			Sfx.play("bow", 0.08, -3.0)
+
+
+func _lob_grenade(from: Vector2, to: Vector2, dur: float, dmg: float, radius: float) -> Shot:
+	var sh := _add_shot("grenade", from, Vector2.ZERO, dmg, 99, 99.0, 0.0, 0.0)
+	sh.start = from
+	sh.target_pos = to
+	sh.dur = dur
+	sh.blast = radius
+	return sh
+
+
+func _swing_mace(w: Dictionary, s: Dictionary) -> void:
+	var r: float = s.radius * stats.area
+	var dir_a := pface.angle()
+	var near := _nearest(ppos, r + 16.0, 1)
+	if near.size() > 0:
+		dir_a = (near[0].pos - ppos).angle()
+	w.swing_t = 0.0
+	w.swing_dir = dir_a
+	for e in _query(ppos, r):
+		var diff := absf(wrapf((e.pos - ppos).angle() - dir_a, -PI, PI))
+		if diff <= s.arc / 2.0 + 0.2:
+			_damage(e, s.dmg, (e.pos - ppos).normalized(), s.knock)
+	Sfx.play("swing", 0.1, -3.0, 0.0)
 
 
 func _update_chucks(w: Dictionary, s: Dictionary, delta: float) -> void:
@@ -749,6 +1145,37 @@ func _update_chucks(w: Dictionary, s: Dictionary, delta: float) -> void:
 				e.chuck_cd = s.cd
 				_damage(e, s.dmg, (e.pos - ppos).normalized(), 50.0)
 	w.points = pts
+
+
+## Supercharged: a high-RPM M-16 plus an under-barrel grenade every 2 seconds.
+func _update_super(delta: float) -> void:
+	var was := super_t
+	super_t -= delta
+	if super_t <= 0.0 and was > 0.0:
+		Sfx.set_music_pitch(1.0)
+		banner = "THE RUSH WEARS OFF..."
+		banner_t = 1.5
+		return
+	super_fire_t -= delta
+	while super_fire_t <= 0.0:
+		super_fire_t += 0.055
+		var near := _nearest(ppos, 210.0, 3)
+		var dir := pface
+		if near.size() > 0:
+			dir = (near[rng.randi() % near.size()].pos - _gun_pos()).normalized()
+		super_aim = dir.angle()
+		dir = dir.rotated(rng.randf_range(-0.06, 0.06))
+		_add_shot("bullet", _gun_pos() + dir * 8.0, dir * 330.0, 9.0, 1, 0.9, 3.0, 15.0)
+		Sfx.play("uzi", 0.12, -7.0, 0.05)
+	super_gl_t -= delta
+	if super_gl_t <= 0.0:
+		super_gl_t = 2.0
+		var near := _nearest(ppos, 200.0, 1)
+		var tp := ppos + Vector2.from_angle(super_aim) * 90.0
+		if near.size() > 0:
+			tp = near[0].pos
+		_lob_grenade(_gun_pos(), tp, 0.35, 45.0, 34.0)
+		Sfx.play("throw", 0.0, -2.0, 0.0)
 
 
 func _add_shot(kind: String, pos: Vector2, vel: Vector2, dmg: float, pierce: int,
@@ -828,7 +1255,9 @@ func _update_pickups(delta: float) -> void:
 	for p in pickups:
 		var d: Vector2 = ppos - p.pos
 		var l2 := d.length_squared()
-		if not p.pulled and l2 < mag2:
+		# powerups must be walked over; everything else is magnetic
+		var reach: float = 64.0 if p.kind == "snow" else mag2
+		if not p.pulled and l2 < reach:
 			p.pulled = true
 			p.spd = -45.0
 		if p.pulled:
@@ -870,6 +1299,18 @@ func _collect(p: Pickup) -> void:
 			score += 500
 			_add_fx("ring", ppos, 0.5, 24.0, Color8(252, 220, 72))
 			Sfx.play("pickup", 0.0, -2.0)
+		"snow":
+			super_t = Data.SUPER_TIME
+			super_fire_t = 0.0
+			super_gl_t = 0.3
+			hp = minf(max_hp, hp + 20.0)
+			banner = "SUPERCHARGED!"
+			banner_t = 2.0
+			shake = 3.0
+			for i in 3:
+				_add_fx("ring", ppos, 0.4 + i * 0.15, 18.0 + i * 10.0, Color.WHITE)
+			Sfx.play("powerup", 0.0, 0.0, 0.0)
+			Sfx.set_music_pitch(1.12)
 
 
 # ====================================================================== fx
@@ -913,9 +1354,9 @@ func _roll_choices() -> Array:
 		elif weapon_order.size() < Data.MAX_WEAPONS:
 			pool.append({"type": "w", "id": id})
 	for id in Data.PASSIVE_ORDER:
-		var lvl: int = passives.get(id, 0)
-		if lvl > 0:
-			if lvl < Data.PASSIVES[id].max:
+		var plvl: int = passives.get(id, 0)
+		if plvl > 0:
+			if plvl < Data.PASSIVES[id].max:
 				pool.append({"type": "p", "id": id})
 		elif passive_order.size() < Data.MAX_PASSIVES:
 			pool.append({"type": "p", "id": id})
@@ -961,10 +1402,10 @@ func _choose(i: int) -> void:
 			else:
 				_add_weapon(c.id)
 		"p":
-			var lvl: int = passives.get(c.id, 0)
-			if lvl == 0:
+			var plvl: int = passives.get(c.id, 0)
+			if plvl == 0:
 				passive_order.append(c.id)
-			passives[c.id] = lvl + 1
+			passives[c.id] = plvl + 1
 			_recalc_stats()
 			if c.id == "heart":
 				hp = minf(max_hp, hp + 20.0)
@@ -981,6 +1422,8 @@ func _game_over() -> void:
 	menu_t = 0.0
 	hp = 0.0
 	Sfx.stop_music()
+	Sfx.set_ambience(false)
+	Sfx.set_music_pitch(1.0)
 	Sfx.play("gameover", 0.0, 0.0, 0.0)
 	_add_fx("boom", ppos, 0.6, 20.0, Color.WHITE)
 
@@ -992,8 +1435,10 @@ func _win() -> void:
 		_add_fx("puff", e.pos, 0.5, 8.0, Color8(252, 220, 72))
 	enemies.clear()
 	shots.clear()
+	eshots.clear()
 	score += 5000
-	Sfx.play("levelup", 0.0, 0.0, 0.0)
+	Sfx.set_music_pitch(1.0)
+	Sfx.play("fanfare", 0.0, 0.0, 0.0)
 
 
 # ====================================================================== input
@@ -1008,9 +1453,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		Sfx.toggle_mute()
 		return
 
-	# touch joystick (works in any state; only used while playing)
+	# touch: dodge button bottom-right, joystick anywhere else
 	if event is InputEventScreenTouch:
-		if event.pressed and touch_idx < 0 and state == State.PLAY:
+		touch_seen = true
+		if event.pressed and state == State.PLAY and hud.dodge_button_rect().has_point(event.position):
+			_try_dodge()
+		elif event.pressed and touch_idx < 0 and state == State.PLAY:
 			touch_idx = event.index
 			touch_origin = event.position
 			touch_vec = Vector2.ZERO
@@ -1032,6 +1480,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			if event.is_action_pressed("pause"):
 				state = State.PAUSE
 				Sfx.play("select", 0.0)
+			elif event.is_action_pressed("dodge"):
+				_try_dodge()
 		State.PAUSE:
 			if event.is_action_pressed("pause") or event.is_action_pressed("confirm") \
 					or (event is InputEventMouseButton and event.pressed):
@@ -1068,6 +1518,33 @@ func _unhandled_input(event: InputEvent) -> void:
 
 # ====================================================================== autotest
 
+## Simple bot for headless testing: grabs pickups, dodges the Don's spray,
+## and walks to the exit once the boss is dead.
+func _bot_move() -> Vector2:
+	if don_dead:
+		if banner_t > 4.0:
+			return Vector2.ZERO
+		return (Vector2(pier_x, BEACH_TOP - 4.0) - ppos).normalized()
+	var v := Vector2.from_angle(time * 0.4) * 0.9
+	if level_id == 1:
+		v = Vector2(1.0 if fmod(time, 40.0) < 20.0 else -1.0, sin(time * 0.7)) * 0.9
+	var best: Pickup = null
+	var bd := 1e9
+	for p in pickups:
+		var d2: float = p.pos.distance_squared_to(ppos)
+		if d2 < bd:
+			bd = d2
+			best = p
+	if best != null and bd < 150.0 * 150.0:
+		v = (best.pos - ppos).normalized()
+	if boss_ref != null and not boss_ref.dead:
+		var to := boss_ref.pos - ppos
+		v = to.normalized() if to.length() > 70.0 else -to.normalized().rotated(0.8)
+	if eshots.size() > 0 and dodge_cd <= 0.0 and rng.randf() < 0.05:
+		_try_dodge()
+	return v
+
+
 func _autotest_step() -> void:
 	if state == State.LEVELUP:
 		if shot_path != "" and shot_at == -2.0 and level >= 3 and menu_t > 0.4:
@@ -1078,20 +1555,27 @@ func _autotest_step() -> void:
 			return
 		_choose(rng.randi() % choices.size())
 	elif state == State.OVER or state == State.WIN:
-		print("AUTOTEST END state=%s time=%.1f level=%d kills=%d" % [State.keys()[state], time, level, kills])
+		print("AUTOTEST END state=%s level_id=%d time=%.1f total=%.1f level=%d kills=%d" % [
+			State.keys()[state], level_id, time, total_time, level, kills])
 		get_tree().quit()
 		return
-	if shot_path != "" and ((shot_at > 0.0 and time >= shot_at) or (shot_at == 0.0 and clock > 1.0)):
+	if shot_path != "" and shot_at == -3.0 and don_dead and banner_t < 5.0:
+		shot_at = 0.0
+	if shot_path != "" and ((shot_at > 0.0 and total_time >= shot_at) or (shot_at == 0.0 and clock > 1.0)):
 		var img := get_viewport().get_texture().get_image()
 		img.save_png(shot_path)
 		print("screenshot saved ", shot_path)
 		shot_path = ""
-	if int(time * 60.0) % 600 == 0 and state == State.PLAY:
-		print("t=%.0f lvl=%d hp=%.0f enemies=%d shots=%d pickups=%d fx=%d weapons=%s passives=%s fps=%d" % [
-			time, level, hp, enemies.size(), shots.size(), pickups.size(), fx.size(),
-			str(weapon_order), str(passives), Engine.get_frames_per_second()])
-	if time >= autotest or (state == State.TITLE and clock > 1.5):
-		print("AUTOTEST DONE time=%.1f level=%d kills=%d enemies=%d" % [time, level, kills, enemies.size()])
+	if int(total_time * 60.0) % 600 == 0 and state == State.PLAY and intro_t <= 0.6:
+		var bhp := ""
+		if boss_ref != null:
+			bhp = " DON_HP=%d atk=%d eshots=%d" % [boss_ref.hp, boss_ref.atk_state, eshots.size()]
+		print("L%d t=%.0f lvl=%d hp=%.0f enemies=%d shots=%d pickups=%d super=%.1f weapons=%s%s fps=%d" % [
+			level_id, time, level, hp, enemies.size(), shots.size(), pickups.size(), super_t,
+			str(weapon_order), bhp, Engine.get_frames_per_second()])
+	if total_time >= autotest or (state == State.TITLE and clock > 1.5):
+		print("AUTOTEST DONE level_id=%d time=%.1f level=%d kills=%d enemies=%d don_dead=%s" % [
+			level_id, time, level, kills, enemies.size(), str(don_dead)])
 		get_tree().quit()
 
 
@@ -1104,11 +1588,16 @@ func _hash(x: int, y: int) -> int:
 
 
 func _view_rect(margin: float = 24.0) -> Rect2:
-	return Rect2(ppos - Vector2(160, 90) - Vector2(margin, margin), Vector2(320, 180) + Vector2(margin, margin) * 2.0)
+	return Rect2(cam_pos - Vector2(160, 90) - Vector2(margin, margin), Vector2(320, 180) + Vector2(margin, margin) * 2.0)
 
 
 func _draw_floor(ci: CanvasItem) -> void:
-	var origin := Vector2(floorf((ppos.x - 200.0) / 64.0) * 64.0, floorf((ppos.y - 140.0) / 64.0) * 64.0)
+	if state == State.TITLE:
+		return
+	if level_id == 1:
+		_draw_beach(ci)
+		return
+	var origin := Vector2(floorf((cam_pos.x - 200.0) / 64.0) * 64.0, floorf((cam_pos.y - 140.0) / 64.0) * 64.0)
 	ci.draw_texture_rect(Art.tex.floor, Rect2(origin, Vector2(64 * 8, 64 * 6)), true)
 	# flat decals: manholes, neon puddles, painted road markings
 	var vr := _view_rect(40.0)
@@ -1143,9 +1632,85 @@ func _draw_floor(ci: CanvasItem) -> void:
 					ci.draw_rect(Rect2(pos + Vector2(-2, -7), Vector2(4, 1)), Color8(150, 140, 120))
 
 
+func _draw_beach(ci: CanvasItem) -> void:
+	var vr := _view_rect(40.0)
+	var x0 := floorf(vr.position.x / 64.0) * 64.0
+	var w := vr.size.x + 128.0
+	# sand
+	ci.draw_texture_rect(Art.tex.sand, Rect2(x0, -128, w, 256), true)
+
+	# dunes along the north edge, with grass tufts
+	ci.draw_rect(Rect2(x0, -100, w, DUNE_Y + 100), Color8(212, 172, 108))
+	ci.draw_rect(Rect2(x0, DUNE_Y - 2, w, 2), Color8(190, 148, 92))
+	ci.draw_rect(Rect2(x0, DUNE_Y, w, 2), Color8(244, 214, 156))
+	var gx := floori(x0 / 6.0)
+	for i in int(w / 6.0):
+		var h := _hash(gx + i, 77)
+		if h % 3 == 0:
+			var px := (gx + i) * 6.0 + h % 5
+			var py := -96.0 + (h / 7) % 22
+			ci.draw_rect(Rect2(px, py, 1, 3), Color8(72, 152, 64))
+			ci.draw_rect(Rect2(px + 1, py + 1, 1, 2), Color8(40, 110, 52))
+			if h % 2 == 0:
+				ci.draw_rect(Rect2(px - 1, py + 1, 1, 2), Color8(96, 176, 80))
+
+	# boardwalk path north from the pier, once the Don is down
+	if pier_active:
+		ci.draw_rect(Rect2(pier_x - 12, -100, 24, DUNE_Y + 104), Color8(150, 100, 60))
+		for yy in range(-100, int(DUNE_Y) + 4, 4):
+			ci.draw_rect(Rect2(pier_x - 12, yy, 24, 1), Color8(110, 70, 44))
+		ci.draw_rect(Rect2(pier_x - 13, -100, 1, DUNE_Y + 104), Color8(80, 50, 32))
+		ci.draw_rect(Rect2(pier_x + 12, -100, 1, DUNE_Y + 104), Color8(80, 50, 32))
+
+	# wet sand + ocean with animated foam
+	var shore := SHORE_Y + sin(clock * 1.1) * 2.0
+	ci.draw_rect(Rect2(x0, shore - 6, w, 6), Color8(200, 160, 104))
+	ci.draw_rect(Rect2(x0, shore, w, 100), Color8(48, 168, 208))
+	ci.draw_rect(Rect2(x0, shore + 10, w, 100), Color8(36, 132, 192))
+	ci.draw_rect(Rect2(x0, shore + 24, w, 100), Color8(28, 100, 168))
+	var fx0 := floori(x0 / 4.0)
+	for i in int(w / 4.0):
+		var px := (fx0 + i) * 4.0
+		var fy := shore + sin(px * 0.11 + clock * 2.2) * 1.5
+		ci.draw_rect(Rect2(px, roundf(fy), 3, 1), Color8(248, 248, 236))
+		var h := _hash(fx0 + i, 5)
+		if h % 9 == 0:
+			var sy := shore + 6.0 + (h / 9) % 30
+			if int(clock * 3.0 + h) % 4 == 0:
+				ci.draw_rect(Rect2(px, sy, 2, 1), Color(1, 1, 1, 0.7))
+			ci.draw_rect(Rect2(px + 3, sy + 3, 4, 1), Color(1, 1, 1, 0.18))
+
+	# the pier: planks out into the water
+	if pier_active:
+		var top := 22.0
+		ci.draw_rect(Rect2(pier_x - 20, top, 40, 100), Color8(160, 108, 64))
+		for yy in range(int(top), int(top) + 100, 4):
+			ci.draw_rect(Rect2(pier_x - 20, yy, 40, 1), Color8(112, 72, 44))
+		for xx in [-20, 19]:
+			ci.draw_rect(Rect2(pier_x + xx, top, 1, 100), Color8(72, 44, 28))
+		for yy in range(int(top) + 8, int(top) + 100, 16):
+			ci.draw_rect(Rect2(pier_x - 23, yy, 3, 5), Color8(72, 44, 28))
+			ci.draw_rect(Rect2(pier_x + 20, yy, 3, 5), Color8(72, 44, 28))
+
+
 func _visible_props() -> Array:
 	var out := []
 	var vr := _view_rect(32.0)
+	if level_id == 1:
+		# palms on the dunes, umbrellas on the sand, the wrecked speedboat
+		for cx in range(floori(vr.position.x / 56.0), floori(vr.end.x / 56.0) + 1):
+			var h := _hash(cx, 11)
+			if h % 100 < 55:
+				out.append(["palm", Vector2(cx * 56 + h % 40, DUNE_Y + 4 + (h / 3) % 6)])
+		for cx in range(floori(vr.position.x / 130.0), floori(vr.end.x / 130.0) + 1):
+			var h := _hash(cx, 23)
+			if h % 100 < 35 and absi(cx) > 0:
+				out.append(["umbrella", Vector2(cx * 130 + h % 90, -40.0 + (h / 5) % 60)])
+		if vr.has_point(Vector2(-46, 50)):
+			out.append(["boat", Vector2(-46, 52)])
+		if pier_active:
+			out = out.filter(func(p): return absf(p[1].x - pier_x) > 26.0)
+		return out
 	var c0 := Vector2i(floori(vr.position.x / PROP_CELL), floori(vr.position.y / PROP_CELL))
 	var c1 := Vector2i(floori(vr.end.x / PROP_CELL), floori(vr.end.y / PROP_CELL))
 	for cx in range(c0.x, c1.x + 1):
@@ -1162,8 +1727,9 @@ func _visible_props() -> Array:
 	return out
 
 
-func _draw_sprite(ci: CanvasItem, tex: Texture2D, pos: Vector2, s: float, flip: bool, mod: Color = Color.WHITE) -> void:
-	ci.draw_set_transform(pos.round(), 0.0, Vector2(-s if flip else s, s))
+func _draw_sprite(ci: CanvasItem, tex: Texture2D, pos: Vector2, s: float, flip: bool,
+		mod: Color = Color.WHITE, rot: float = 0.0) -> void:
+	ci.draw_set_transform(pos.round(), rot, Vector2(-s if flip else s, s))
 	ci.draw_texture(tex, Vector2(-tex.get_width() / 2, -tex.get_height() / 2 - 2), mod)
 	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
@@ -1184,7 +1750,13 @@ func _draw_world(ci: CanvasItem) -> void:
 			_:
 				var t: Texture2D = Art.tex[p.kind]
 				ci.draw_texture(Art.tex.shadow, (p.pos + Vector2(-6, 3)).round())
+				if p.kind == "snow":
+					# glittering pile
+					var g := 0.5 + 0.5 * sin(clock * 6.0)
+					ci.draw_circle(p.pos.round(), 9.0, Color(1, 1, 1, 0.12 + 0.1 * g))
 				ci.draw_texture(t, (p.pos - Vector2(t.get_width() / 2, t.get_height() / 2 + bob)).round())
+				if p.kind == "snow" and int(clock * 8.0) % 3 == 0:
+					ci.draw_rect(Rect2((p.pos + Vector2(rng.randi_range(-5, 5), rng.randi_range(-6, 0))).round(), Vector2.ONE), Color.WHITE)
 
 	# y-sorted actors and props
 	var list := []
@@ -1205,38 +1777,78 @@ func _draw_world(ci: CanvasItem) -> void:
 				var st: Texture2D = Art.tex.shadow_big if e.boss else Art.tex.shadow
 				ci.draw_texture(st, (e.pos + Vector2(-st.get_width() / 2, 5.0 * e.scale)).round())
 			1:
-				ci.draw_texture(Art.tex.shadow, (ppos + Vector2(-6, 5)).round())
+				if intro_t <= 1.2:
+					ci.draw_texture(Art.tex.shadow, (ppos + Vector2(-6, 5)).round())
 
 	for it in list:
 		match it[1]:
 			0:
-				var e: Enemy = it[2]
-				var frame := int(e.anim * 4.0) % 2
-				var mod := Color.WHITE
-				if e.flash > 0.0:
-					mod = Color(6, 6, 6)
-				_draw_sprite(ci, Art.tex["%s_%d" % [e.kind, frame]], e.pos, e.scale, e.face_left, mod)
-				if e.boss:
-					var w := 30.0
-					var bp := (e.pos + Vector2(-w / 2.0, -22.0 * e.scale / 2.0 - 14.0)).round()
-					ci.draw_rect(Rect2(bp - Vector2.ONE, Vector2(w + 2, 4)), Color8(20, 14, 28))
-					ci.draw_rect(Rect2(bp, Vector2(w * maxf(0.0, e.hp / e.max_hp), 2)), Color8(236, 84, 200))
+				_draw_enemy(ci, it[2])
 			1:
-				var frame := (int(anim_t * 8.0) % 2) if pmoving else 0
-				var mod := Color.WHITE
-				if hurt_t > 0.0 and int(clock * 30.0) % 2 == 0:
-					mod = Color(1.0, 0.35, 0.35)
-				_draw_sprite(ci, Art.tex["hero_%d" % frame], ppos, 1.0, pface.x < 0.0, mod)
-				if hp < max_hp:
-					var hb := (ppos + Vector2(-8, 9)).round()
-					ci.draw_rect(Rect2(hb - Vector2.ONE, Vector2(18, 4)), Color8(20, 14, 28))
-					ci.draw_rect(Rect2(hb, Vector2(16.0 * maxf(0.0, hp / max_hp), 2)), Color8(228, 44, 60))
+				_draw_player(ci)
 			2:
 				var pr: Array = it[2]
 				var t: Texture2D = Art.tex[pr[0]]
 				var pos: Vector2 = pr[1]
-				ci.draw_texture(Art.tex.shadow, (pos + Vector2(-6, -2)).round())
+				if pr[0] != "boat":
+					ci.draw_texture(Art.tex.shadow, (pos + Vector2(-6, -2)).round())
 				ci.draw_texture(t, (pos - Vector2(t.get_width() / 2, t.get_height())).round())
+
+
+func _draw_enemy(ci: CanvasItem, e: Enemy) -> void:
+	var frame := int(e.anim * 4.0) % 2
+	var mod := Color.WHITE
+	if e.flash > 0.0:
+		mod = Color(6, 6, 6)
+	_draw_sprite(ci, Art.tex["%s_%d" % [e.kind, frame]], e.pos, e.scale, e.face_left, mod)
+	if e.kind == "don":
+		# muzzle flash while spraying, "!" while revving
+		if e.atk_state == 2 and int(clock * 30.0) % 2 == 0:
+			var mz := e.pos + Vector2(-17.0 if e.face_left else 17.0, 6.0)
+			ci.draw_circle(mz.round(), 3.0, Color8(252, 220, 72))
+			ci.draw_circle(mz.round(), 1.5, Color.WHITE)
+		elif e.atk_state == 1:
+			Art.draw_text(ci, "!", e.pos + Vector2(-2, -34), Color8(228, 44, 60), 2, 0, true)
+	elif e.boss:
+		var w := 30.0
+		var bp := (e.pos + Vector2(-w / 2.0, -22.0 * e.scale / 2.0 - 14.0)).round()
+		ci.draw_rect(Rect2(bp - Vector2.ONE, Vector2(w + 2, 4)), Color8(20, 14, 28))
+		ci.draw_rect(Rect2(bp, Vector2(w * maxf(0.0, e.hp / e.max_hp), 2)), Color8(236, 84, 200))
+
+
+func _draw_player(ci: CanvasItem) -> void:
+	if intro_t > 1.2:
+		# lying in the sand, then a little shake as he comes to
+		var jitter := Vector2(1, 0) if intro_t < 1.8 and int(clock * 20.0) % 2 == 0 else Vector2.ZERO
+		_draw_sprite(ci, Art.tex.hero_0, ppos + Vector2(0, 6) + jitter, 1.0, false, Color.WHITE, -PI / 2.0)
+		if int(clock * 2.0) % 2 == 0:
+			Art.draw_text(ci, "Z", ppos + Vector2(8, -14), Color.WHITE, 1, 0, true)
+		return
+	var frame := (int(anim_t * 8.0) % 2) if pmoving else 0
+	var mod := Color.WHITE
+	if super_t > 0.0:
+		var k := 0.5 + 0.5 * sin(clock * 20.0)
+		mod = Color(1.0 + k * 0.6, 1.0 + k * 0.3, 1.0 + k * 0.6)
+	if hurt_t > 0.0 and int(clock * 30.0) % 2 == 0:
+		mod = Color(1.0, 0.35, 0.35)
+	if iframe_t > 0.0 and dodge_t <= 0.0 and int(clock * 30.0) % 2 == 0:
+		mod.a = 0.4
+	var rot := 0.0
+	if dodge_t > 0.0:
+		rot = (1.0 - dodge_t / DODGE_TIME) * TAU * (1.0 if dodge_dir.x >= 0.0 else -1.0)
+	_draw_sprite(ci, Art.tex["hero_%d" % frame], ppos, 1.0, pface.x < 0.0, mod, rot)
+
+	if super_t > 0.0 and dodge_t <= 0.0:
+		# M-16 held toward the target
+		var left := cos(super_aim) < 0.0
+		ci.draw_set_transform((_gun_pos() + Vector2(0, 1)).round(), super_aim, Vector2(1, -1 if left else 1))
+		ci.draw_texture(Art.tex.m16, Vector2(-4, -3))
+		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+	if hp < max_hp:
+		var hb := (ppos + Vector2(-8, 9)).round()
+		ci.draw_rect(Rect2(hb - Vector2.ONE, Vector2(18, 4)), Color8(20, 14, 28))
+		ci.draw_rect(Rect2(hb, Vector2(16.0 * maxf(0.0, hp / max_hp), 2)), Color8(228, 44, 60))
 
 
 func _draw_top(ci: CanvasItem) -> void:
@@ -1263,24 +1875,46 @@ func _draw_top(ci: CanvasItem) -> void:
 			ci.draw_texture(t, -Vector2(t.get_width() / 2, t.get_height() / 2))
 		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
+	# mace swing
+	if weapons.has("mace") and state != State.OVER:
+		var w: Dictionary = weapons.mace
+		var dur := 0.2
+		if w.swing_t < dur:
+			var k: float = w.swing_t / dur
+			var arc: float = w.s.arc
+			var r: float = w.s.radius * stats.area
+			var a: float = w.swing_dir - arc / 2.0 + arc * k
+			ci.draw_arc(ppos.round(), r * 0.8, w.swing_dir - arc / 2.0, a, 24, Color(Color8(252, 220, 72), 0.5 * (1.0 - k)), 3.0)
+			ci.draw_set_transform((ppos + Vector2.from_angle(a) * 6.0).round(), a, Vector2.ONE)
+			ci.draw_texture(Art.tex.mace, Vector2(0, -3))
+			ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
 	# projectiles
 	for sh in shots:
 		match sh.kind:
 			"grenade":
 				var k := minf(1.0, sh.t / sh.dur)
-				var hgt := sin(k * PI) * 26.0
+				var hgt := sin(k * PI) * 26.0 * clampf(sh.dur / 0.55, 0.5, 1.0)
 				ci.draw_texture(Art.tex.shadow, (sh.pos + Vector2(-6, 2)).round())
 				ci.draw_set_transform((sh.pos - Vector2(0, hgt)).round(), sh.rot, Vector2.ONE)
 				ci.draw_texture(Art.tex.grenade, Vector2(-3, -3))
 			"rocket":
 				ci.draw_set_transform(sh.pos.round(), sh.vel.angle(), Vector2.ONE)
 				ci.draw_texture(Art.tex.rocket, Vector2(-5, -2))
+			"bolt":
+				ci.draw_set_transform(sh.pos.round(), sh.vel.angle(), Vector2.ONE)
+				ci.draw_texture(Art.tex.bolt, Vector2(-4, -1))
 			"pellet":
 				ci.draw_texture(Art.tex.pellet, (sh.pos - Vector2(1, 1)).round())
 			_:
 				ci.draw_set_transform(sh.pos.round(), sh.vel.angle(), Vector2.ONE)
 				ci.draw_texture(Art.tex.bullet, Vector2(-2, -1))
 		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+	# the Don's minigun bullets
+	for s in eshots:
+		ci.draw_rect(Rect2((s.pos - Vector2(2, 2)).round(), Vector2(4, 4)), Color8(144, 20, 44))
+		ci.draw_rect(Rect2((s.pos - Vector2(1, 1)).round(), Vector2(2, 2)), Color8(252, 220, 72))
 
 	# effects
 	for f in fx:
@@ -1305,5 +1939,21 @@ func _draw_top(ci: CanvasItem) -> void:
 				ci.draw_circle(f.pos.round(), f.r * (0.6 + k), Color(f.color, 0.6 * (1.0 - k)))
 			"ring":
 				ci.draw_arc(ppos.round(), f.r * (0.4 + k), 0.0, TAU, 32, Color(f.color, 1.0 - k), 2.0)
+			"ghost":
+				_draw_sprite(ci, Art.tex.hero_0, f.pos, 1.0, f.flip, Color(0.4, 0.9, 1.0, 0.5 * (1.0 - k)), f.rot)
 			"text":
 				Art.draw_text(ci, f.text, f.pos, Color(f.color, 1.0 - maxf(0.0, k - 0.6) * 2.5), 1, 1, true)
+
+	# exit arrow from the pier, pointing north to Main Street
+	if don_dead:
+		var bobv := sin(clock * 5.0) * 3.0
+		var tip := Vector2(pier_x, -88.0 + bobv).round()
+		var col := Color8(252, 220, 72) if int(clock * 4.0) % 2 == 0 else Color8(252, 136, 40)
+		var pts := PackedVector2Array([tip, tip + Vector2(-9, 10), tip + Vector2(-4, 10),
+			tip + Vector2(-4, 20), tip + Vector2(4, 20), tip + Vector2(4, 10), tip + Vector2(9, 10)])
+		var outline := PackedVector2Array()
+		for p in pts:
+			outline.append(p + Vector2(1, 1))
+		ci.draw_colored_polygon(outline, Color8(20, 14, 28))
+		ci.draw_colored_polygon(pts, col)
+		Art.draw_text(ci, "MAIN ST", Vector2(pier_x + 14, -84.0 + bobv), Color.WHITE, 1, 0, true)

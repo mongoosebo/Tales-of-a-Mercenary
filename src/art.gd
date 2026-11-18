@@ -300,6 +300,93 @@ const CRATE := [
 	"kkkkkkkkkk",
 ]
 
+# Beach boss: slick hair, one-piece wraparound shades, pink suit, minigun
+const DON_TOP := [
+	"......kkkkk.....",
+	".....knnnnnk....",
+	"....knnNnnnnk...",
+	"....knssssssk...",
+	"....kkkkkkkkkk..",
+	"....kkkkckkkkk..",
+	"....kssssSssk...",
+	".....ksSSSsk....",
+	"...kppwyywppk...",
+	"..kpppwyywpppkkk",
+	"..kpkpwwwwkmmmmk",
+]
+const DON_LEGS_A := [
+	"..ksk.kwwkkMmmmk",
+	"....kpppppkkkkk.",
+	"....kppk.kppk...",
+	"....kppk.kppk...",
+	"....kwwk.kwwk...",
+]
+const DON_LEGS_B := [
+	"..ksk.kwwkkMmmmk",
+	"...kppk.kppkkkk.",
+	"..kppk...kppk...",
+	".kppk.....kppk..",
+	".kwwk.....kwwk..",
+]
+
+const BOAT := [
+	"...........kkk..................",
+	"..........kcck..................",
+	".....kkkkkkcckkkkkkkkkkkk.......",
+	"....krrrrrrrrrrrrrrrrrrrrkkk....",
+	"...kwwwwwwwwwwwwwwwwwwwwwwwwkk..",
+	"..kwwwwwwwwkkwwwwwwwwwwwwwwwwwk.",
+	".kwwwwwwwwk..kwwwwrrrrrrwwwwwwwk",
+	"..kmmmmmmmmkkmmmmmmmmmmmmmmmmmk.",
+	"...kMMMMMMMMMMMMMMMMMMMMMMMMMk..",
+	"....kkkkkkkkkkkkkkkkkkkkkkkkk...",
+]
+const UMBRELLA := [
+	"......kkkkk.....",
+	"...kkpwpwpwpkk..",
+	"..kpwpwpwpwpwpk.",
+	".kpwpwpwpwpwpwpk",
+	".kkkkkkkkkkkkkkk",
+	".......kl.......",
+	".......kl.......",
+	".......kl.......",
+	".......kl.......",
+	".......kl.......",
+	".......kl.......",
+	"......kkllk.....",
+]
+const SNOW := [
+	".....kk.....",
+	"....kwwk....",
+	"...kwwwmk...",
+	"..kwwwwwmk..",
+	".kwwwwwwwmk.",
+	"kccccccccccc",
+	"kCCCCCCCCCCk",
+]
+const M16 := [
+	"......kkk.......",
+	"kkkkkkkGkkkkkkk.",
+	"kgggggggggggggGk",
+	"kgkkkkgkkkkkkkk.",
+	"kk...kgkk.......",
+	".....kgggk......",
+	"......kkk.......",
+]
+const MACE := [
+	".........kkkk..",
+	"kkkk.kkkkyyyyk.",
+	"kLLkkyyyyyyyyyk",
+	"kLLkkyyyyyyyyyk",
+	"kkkk.kkkkyyyyk.",
+	".........kkkk..",
+]
+const BOLT := [
+	"r......",
+	"lllllmw",
+	"r......",
+]
+
 # ------------------------------------------------------------------ icons (10x10)
 
 const ICONS := {
@@ -384,6 +471,54 @@ const ICONS := {
 		"kkkkgkkkkk",
 		"....gk....",
 		"....kk....",
+		"..........",
+		"..........",
+	],
+	"ak": [
+		"..........",
+		"..........",
+		"kkkkkkkkkk",
+		"klllgggggk",
+		"kllkgkkkkk",
+		"kkk.lk....",
+		"....lk....",
+		"....kk....",
+		"..........",
+		"..........",
+	],
+	"crossbow": [
+		"....k.....",
+		"....lk....",
+		"....l.k...",
+		"....l..k..",
+		"kkkklmmmmw",
+		"....l..k..",
+		"....l.k...",
+		"....lk....",
+		"....k.....",
+		"..........",
+	],
+	"mace": [
+		"......kkk.",
+		".....kyyyk",
+		"....kyyyyk",
+		"...kyyyyk.",
+		"..kyyyk...",
+		".kLLk.....",
+		"kLLk......",
+		"kkk.......",
+		"..........",
+		"..........",
+	],
+	"snow": [
+		"..........",
+		"....kk....",
+		"...kwwk...",
+		"..kwwwmk..",
+		".kwwwwwmk.",
+		"kccccccccc",
+		"kCCCCCCCCk",
+		"..........",
 		"..........",
 		"..........",
 	],
@@ -616,6 +751,15 @@ func _init() -> void:
 	tex["palm"] = make(PALM)
 	tex["drum"] = make(DRUM)
 	tex["crate"] = make(CRATE)
+	tex["don_0"] = make(DON_TOP + DON_LEGS_A)
+	tex["don_1"] = make(DON_TOP + DON_LEGS_B)
+	tex["boat"] = make(BOAT)
+	tex["umbrella"] = make(UMBRELLA)
+	tex["snow"] = make(SNOW)
+	tex["m16"] = make(M16)
+	tex["mace"] = make(MACE)
+	tex["bolt"] = make(BOLT)
+	tex["sand"] = _make_sand()
 	tex["shadow"] = _make_shadow(12, 4)
 	tex["shadow_big"] = _make_shadow(22, 6)
 	tex["floor"] = _make_floor()
@@ -682,6 +826,33 @@ func _make_floor() -> ImageTexture:
 			p += Vector2i(1, rng.randi_range(-1, 1))
 			p.x = clampi(p.x, 2, size - 2)
 			p.y = clampi(p.y, 2, size - 2)
+	return ImageTexture.create_from_image(img)
+
+
+func _make_sand() -> ImageTexture:
+	# 64x64 warm sand with grain, little shells and footprints
+	var size := 64
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	var base := Color8(232, 196, 132)
+	var dark := Color8(208, 168, 108)
+	var light := Color8(248, 220, 160)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 1984
+	for y in size:
+		for x in size:
+			var c := base
+			var r := rng.randf()
+			if r < 0.12:
+				c = dark
+			elif r < 0.18:
+				c = light
+			# soft wind ripples
+			if (x + y * 3 + int(sin(x * 0.3) * 2.0)) % 23 == 0:
+				c = dark
+			img.set_pixel(x, y, c)
+	for shell in [Vector2i(12, 20), Vector2i(44, 50), Vector2i(50, 8)]:
+		img.set_pixelv(shell, Color8(248, 248, 236))
+		img.set_pixelv(shell + Vector2i(1, 0), Color8(236, 150, 170))
 	return ImageTexture.create_from_image(img)
 
 

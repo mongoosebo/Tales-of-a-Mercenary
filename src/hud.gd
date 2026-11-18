@@ -23,6 +23,7 @@ const LEVELUP := 2
 const PAUSE := 3
 const OVER := 4
 const WIN := 5
+const TRANSITION := 6
 
 var game  # game.gd
 
@@ -33,6 +34,10 @@ func _process(_delta: float) -> void:
 
 func card_rect(i: int) -> Rect2:
 	return Rect2(36, 38 + i * 44, 248, 38)
+
+
+func dodge_button_rect() -> Rect2:
+	return Rect2(W - 44, H - 48, 42, 42)
 
 
 func _draw() -> void:
@@ -51,6 +56,9 @@ func _draw() -> void:
 			_draw_over(false)
 		WIN:
 			_draw_over(true)
+		TRANSITION:
+			_draw_transition()
+	_draw_level_card()
 	_draw_touch_stick()
 
 
@@ -113,11 +121,52 @@ func _draw_hud() -> void:
 	draw_rect(Rect2(3, H - 8, 64 * hpk, 5), C_RED)
 	draw_rect(Rect2(3, H - 8, 64 * hpk, 1), Color(1, 1, 1, 0.4))
 	_text("%d" % ceili(maxf(0.0, game.hp)), Vector2(72, H - 10), C_WHITE)
+	if game.level_id == 1 and not game.pier_active:
+		var left: float = maxf(0.0, game.lvl.duration - game.time)
+		_text("PIER " + _fmt_time(left), Vector2(W / 2, 18), C_GREY, 1, 1)
+
+	# dodge meter under the HP bar
+	var dk: float = clampf(1.0 - game.dodge_cd / 0.9, 0.0, 1.0)
+	draw_rect(Rect2(2, H - 13, 34, 3), C_DARK)
+	draw_rect(Rect2(3, H - 12, 32 * dk, 1), C_CYAN if dk >= 1.0 else C_GREY)
+
+	# supercharge timer
+	if game.super_t > 0.0:
+		var sk: float = game.super_t / Data.SUPER_TIME
+		var col := C_WHITE if int(game.clock * 10.0) % 2 == 0 else C_PINK
+		_icon("snow", Vector2(W / 2 - 52, 26))
+		draw_rect(Rect2(W / 2 - 40, 29, 82, 6), C_DARK)
+		draw_rect(Rect2(W / 2 - 39, 30, 80 * sk, 4), col)
+		_text("SUPERCHARGED", Vector2(W / 2, 37), col, 1, 1)
+
+	# big boss health bar
+	if game.boss_ref != null and not game.boss_ref.dead:
+		var b = game.boss_ref
+		var bk: float = clampf(b.hp / b.max_hp, 0.0, 1.0)
+		_text("DON FLAMINGO", Vector2(W / 2, H - 26), C_PINK, 1, 1)
+		draw_rect(Rect2(W / 2 - 81, H - 17, 162, 7), C_DARK)
+		draw_rect(Rect2(W / 2 - 80, H - 16, 160 * bk, 5), C_PINK)
+		draw_rect(Rect2(W / 2 - 80, H - 16, 160 * bk, 1), Color(1, 1, 1, 0.5))
+
+	# exit hint
+	if game.don_dead and game.state == PLAY:
+		var dx: float = game.pier_x - game.ppos.x
+		if absf(dx) > 150.0:
+			var ax := W - 12.0 if dx > 0.0 else 12.0
+			_text(">" if dx > 0.0 else "<", Vector2(ax, 80), C_YELLOW, 2, 1)
+		if game.banner_t <= 0.0 and int(game.clock * 2.0) % 2 == 0:
+			_text("HEAD NORTH FROM THE PIER", Vector2(W / 2, 50), C_YELLOW, 1, 1)
+
+	# touch dodge button (only once a touch has been seen)
+	if game.touch_seen:
+		var r := dodge_button_rect()
+		draw_arc(r.get_center(), 18, 0, TAU, 24, Color(1, 1, 1, 0.35 if dk >= 1.0 else 0.15), 1.0)
+		_text("ROLL", r.get_center() - Vector2(0, 3), Color(1, 1, 1, 0.6 if dk >= 1.0 else 0.25), 1, 1, false)
 
 	# event banner
 	if game.banner_t > 0.0 and game.state == PLAY:
 		if int(game.clock * 6.0) % 2 == 0:
-			_text(game.banner, Vector2(W / 2, 40), C_RED if game.banner.begins_with("WARNING") else C_YELLOW, 1, 1)
+			_text(game.banner, Vector2(W / 2, 50), C_RED if game.banner.begins_with("WARNING") else C_YELLOW, 1, 1)
 
 
 func _slot(pos: Vector2, icon: String, lvl: int) -> void:
@@ -182,6 +231,26 @@ func _draw_over(won: bool) -> void:
 	_text(str(game.score), Vector2(236, 116), C_YELLOW, 1, 2)
 	if game.menu_t > 1.2 and int(game.clock * 2.0) % 2 == 0:
 		_text("PRESS ANY KEY OR TAP TO RETRY", Vector2(W / 2, 150), C_WHITE, 1, 1)
+
+
+# ---------------------------------------------------------------- level card / transition
+
+func _draw_level_card() -> void:
+	if game.state != PLAY or game.card_t <= 0.0:
+		return
+	var a: float = clampf(game.card_t, 0.0, 1.0)
+	var y := 56.0
+	draw_rect(Rect2(0, y - 6, W, 34), Color(0.05, 0.02, 0.1, 0.7 * a))
+	_text(game.lvl.name, Vector2(W / 2, y), Color(C_YELLOW, a), 2, 1)
+	_text(game.lvl.sub, Vector2(W / 2, y + 18), Color(C_WHITE, a), 1, 1)
+
+
+func _draw_transition() -> void:
+	var t: float = game.trans_t
+	var a := clampf(t, 0.0, 1.0) if t < 1.0 else clampf(1.6 - t, 0.0, 1.0) / 0.6
+	draw_rect(Rect2(0, 0, W, H), Color(0.05, 0.02, 0.1, a))
+	if t < 1.0:
+		_text("LEVEL CLEAR!", Vector2(W / 2, H / 2 - 8), Color(C_YELLOW, a), 2, 1)
 
 
 # ---------------------------------------------------------------- touch stick
@@ -270,6 +339,6 @@ func _draw_title() -> void:
 
 	if int(t * 2.0) % 2 == 0:
 		_text("PRESS ANY KEY / TAP TO START", Vector2(W / 2, 100), C_WHITE, 1, 1)
-	_text("WASD/ARROWS/STICK: MOVE", Vector2(4, H - 18), C_GREY)
+	_text("WASD/ARROWS/STICK: MOVE", Vector2(4, H - 27), C_GREY)
+	_text("SHIFT/SPACE/B: DODGE ROLL", Vector2(4, H - 18), C_GREY)
 	_text("GUNS FIRE BY THEMSELVES", Vector2(4, H - 9), C_GREY)
-	_text("SURVIVE 15:00", Vector2(W - 4, H - 9), C_YELLOW, 1, 2)

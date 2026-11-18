@@ -4,7 +4,8 @@ extends RefCounted
 const MAX_WEAPONS := 6
 const MAX_PASSIVES := 6
 
-const WEAPON_ORDER := ["pistol", "uzi", "shotgun", "grenade", "boombox", "chucks", "rocket"]
+const WEAPON_ORDER := ["pistol", "uzi", "shotgun", "grenade", "boombox", "chucks", "rocket",
+	"ak", "crossbow", "mace"]
 
 const WEAPONS := {
 	"pistol": {
@@ -42,6 +43,21 @@ const WEAPONS := {
 		"desc": ["HOMING ROCKET, BIG EXPLOSION", "+15 DAMAGE", "+1 ROCKET",
 			"BIGGER BLAST", "FASTER RELOAD", "+1 ROCKET, +20 DAMAGE"],
 	},
+	"ak": {
+		"name": "AK-47", "icon": "ak",
+		"desc": ["3-ROUND BURSTS AT NEAREST FOE", "+2 BULLETS PER BURST", "+6 DAMAGE",
+			"FASTER RELOAD", "BULLETS PIERCE +2", "+3 BULLETS, +6 DAMAGE"],
+	},
+	"crossbow": {
+		"name": "CROSSBOW", "icon": "crossbow",
+		"desc": ["BOLTS PIERCE THROUGH CROWDS", "+15 DAMAGE", "+1 BOLT",
+			"BOLTS PIERCE +6 MORE", "FASTER RELOAD", "+1 BOLT, +20 DAMAGE"],
+	},
+	"mace": {
+		"name": "YELLOW DILDO MACE", "icon": "mace",
+		"desc": ["SMACKS FOES IN FRONT OF YOU", "+12 DAMAGE", "LONGER REACH",
+			"FASTER SWINGS", "SWINGS ALL THE WAY AROUND", "+20 DAMAGE"],
+	},
 }
 
 const PASSIVE_ORDER := ["tape", "dumbbell", "vest", "cola", "hairspray", "walkman", "magnet", "heart", "headband"]
@@ -63,8 +79,28 @@ const ENEMIES := {
 	"ninja": {"hp": 6.0, "speed": 50.0, "dmg": 8.0, "xp": 1, "r": 5.0, "scale": 1.0},
 	"biker": {"hp": 35.0, "speed": 24.0, "dmg": 16.0, "xp": 3, "r": 6.0, "scale": 1.0},
 	"robot": {"hp": 80.0, "speed": 20.0, "dmg": 22.0, "xp": 8, "r": 6.0, "scale": 1.0},
+	"don": {"hp": 22000.0, "speed": 24.0, "dmg": 30.0, "xp": 0, "r": 12.0, "scale": 2.0},
 	"boss": {"hp": 1400.0, "speed": 32.0, "dmg": 35.0, "xp": 0, "r": 13.0, "scale": 2.0},
 }
+
+
+## Levels. "diff" maps level time to difficulty minutes: offset + time * scale.
+const LEVELS := {
+	1: {
+		"name": "LEVEL 1: THE BEACH", "sub": "WASHED UP. NO BOAT. ONE GUN.",
+		"duration": 1200.0, "diff_offset": 0.0, "diff_scale": 0.75,
+		"events": [[120.0, "pincer"], [300.0, "swarm"], [420.0, "boss"], [540.0, "pincer"],
+			[720.0, "swarm"], [840.0, "boss"], [960.0, "pincer"], [1080.0, "swarm"]],
+	},
+	2: {
+		"name": "LEVEL 2: MAIN STREET", "sub": "THE KINGPIN RUNS THIS TOWN.",
+		"duration": 900.0, "diff_offset": 12.0, "diff_scale": 1.0,
+		"events": [[150.0, "ring"], [300.0, "boss"], [390.0, "ring"], [480.0, "swarm"],
+			[600.0, "boss"], [690.0, "ring"], [780.0, "swarm"], [840.0, "boss"]],
+	},
+}
+
+const SUPER_TIME := 20.0
 
 
 static func weapon_max(_id: String) -> int:
@@ -124,4 +160,25 @@ static func weapon_stats(id: String, lvl: int) -> Dictionary:
 			if lvl >= 4: s.radius += 10
 			if lvl >= 5: s.cd -= 0.8
 			if lvl >= 6: s.count += 1; s.dmg += 20
+		"ak":
+			s = {"dmg": 14.0, "cd": 1.3, "count": 3, "pierce": 2, "speed": 300.0}
+			if lvl >= 2: s.count += 2
+			if lvl >= 3: s.dmg += 6
+			if lvl >= 4: s.cd -= 0.3
+			if lvl >= 5: s.pierce += 2
+			if lvl >= 6: s.count += 3; s.dmg += 6
+		"crossbow":
+			s = {"dmg": 30.0, "cd": 1.8, "count": 1, "pierce": 6, "speed": 210.0, "knock": 60.0}
+			if lvl >= 2: s.dmg += 15
+			if lvl >= 3: s.count += 1
+			if lvl >= 4: s.pierce += 6
+			if lvl >= 5: s.cd -= 0.5
+			if lvl >= 6: s.count += 1; s.dmg += 20
+		"mace":
+			s = {"dmg": 25.0, "cd": 1.1, "arc": 2.4, "radius": 30.0, "knock": 130.0}
+			if lvl >= 2: s.dmg += 12
+			if lvl >= 3: s.radius += 8
+			if lvl >= 4: s.cd -= 0.3
+			if lvl >= 5: s.arc = TAU
+			if lvl >= 6: s.dmg += 20
 	return s
